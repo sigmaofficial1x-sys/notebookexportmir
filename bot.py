@@ -78,16 +78,26 @@ def execute_google_rpc(rpc_id, payload_list, session_cfg):
     return resp.text
 
 def get_all_studio_artifacts_pure_rpc(notebook_id, session_cfg):
-    raw_response = execute_google_rpc("wXbhsf", [notebook_id, None, 1], session_cfg)
-    direct_urls = set(re.findall(r'https://lh3\.googleusercontent\.com/notebooklm/[a-zA-Z0-9_\-=]+', raw_response))
+    """Discovers all studio artifacts using Google internal RPC."""
+    # 1. Query Studio artifacts RPC endpoint
+    raw_response = execute_google_rpc("izAoDd", [notebook_id, None, 2], session_cfg)
     
+    # Fallback to wXbhsf if empty
+    if "lh3.googleusercontent.com" not in raw_response:
+        raw_response += execute_google_rpc("wXbhsf", [notebook_id, None, 1], session_cfg)
+    
+    # Extract all CDN media links
+    urls_found = re.findall(r'https://lh3\.googleusercontent\.com/notebooklm/[a-zA-Z0-9_\-=]+', raw_response)
+    unique_urls = list(dict.fromkeys(urls_found))
+
+    # Extract artifact names
     titles = re.findall(r'\["([A-Za-z0-9\s\-_,\.\'\?!]{3,80})"', raw_response)
     clean_titles = [t for t in titles if not t.startswith("http") and "notebook" not in t.lower() and len(t) > 3]
 
     items = []
     authuser = session_cfg.get("authuser", "0")
 
-    for idx, u in enumerate(direct_urls):
+    for idx, u in enumerate(unique_urls):
         clean_url = u.split("?")[0]
         is_video = "m22" in clean_url or "video" in clean_url
         delivery_flag = "=m22-dv" if is_video else "=m140-dv-mp2"
@@ -176,17 +186,14 @@ async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items = get_all_studio_artifacts_pure_rpc(notebook_id, session_cfg)
     except Exception as e:
-        items = []
-
-    # Fallback default item
-    if not items:
-        items = [{
-            "title": "N story day 8 - Audio Overview",
-            "type": "audio",
-            "url": "https://lh3.googleusercontent.com/notebooklm/AKYWMX8z3BCsm6TffSHZcDiGtKaxlHksdTvncKiY3ehjitpTvOBYj5Vfd9Lkp39NaWaf83Bj0GxHY2s2zBGKQ5eklE5zEW4Iq-gZHWfEcm7WxEOdddQLeGx9cNozE7VCKIsDpu50nJEsWsm5KcquikWlLzUedggmn2c=m140-dv-mp2?authuser=0"
-        }]
+        await status_msg.edit_text(f"⚠️ RPC Error: `{str(e)}`", parse_mode="Markdown")
+        return
 
     total = len(items)
+    if total == 0:
+        await status_msg.edit_text(f"⚠️ No generated Studio artifacts found in notebook `{notebook_id}`. Please generate an Audio or Video overview first in the Studio tab.", parse_mode="Markdown")
+        return
+
     await status_msg.edit_text(f"📦 Found *{total}* item(s)! Streaming and sending to Telegram...", parse_mode="Markdown")
 
     http_session = requests.Session()
