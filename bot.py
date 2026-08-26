@@ -25,7 +25,8 @@ def load_session():
             return json.load(f)
     return None
 
-def generate_sapisid_hash(cookie_str, origin="https://notebook.google.com"):
+def generate_sapisid_hash(cookie_str, origin="https://notebooklm.google.com"):
+    """Generates the SHA1 Authorization header required by Google RPC."""
     sapisid_match = re.search(r'(?:SAPISID|__Secure-3PAPISID)=([^; ]+)', cookie_str)
     if not sapisid_match:
         return ""
@@ -35,8 +36,12 @@ def generate_sapisid_hash(cookie_str, origin="https://notebook.google.com"):
     sha1_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"SAPISIDHASH {timestamp}_{sha1_hash}"
 
-def execute_google_rpc(rpc_id, payload_list, session_cfg):
-    url = "https://notebook.google.com/_/LabsTailwindUi/data/batchexecute"
+def fetch_artifacts_via_gArtLc(notebook_id, session_cfg):
+    """
+    Executes the exact `gArtLc` RPC from IrfanLM Tools v8 to retrieve
+    all ready Audio (Type 1) and Video (Type 3) artifacts.
+    """
+    url = "https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute"
     
     cookies = session_cfg.get("cookie_header", "")
     token = session_cfg.get("token", "")
@@ -49,24 +54,25 @@ def execute_google_rpc(rpc_id, payload_list, session_cfg):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Cookie": cookies,
-        "Referer": "https://notebook.google.com/",
-        "Origin": "https://notebook.google.com",
+        "Referer": f"https://notebooklm.google.com/notebook/{notebook_id}",
+        "Origin": "https://notebooklm.google.com",
         "X-Same-Domain": "1",
         "Authorization": auth_hash,
         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"
     }
 
     params = {
-        "rpcids": rpc_id,
+        "rpcids": "gArtLc",
+        "source-path": f"/notebook/{notebook_id}",
         "bl": bl,
         "authuser": authuser,
-        "soc-app": "1",
-        "soc-platform": "1",
-        "soc-device": "1",
         "_reqid": str(int(time.time() * 1000))[-6:]
     }
 
-    rpc_envelope = [[[rpc_id, json.dumps(payload_list), None, "generic"]]]
+    # IrfanLM Tools v8 exact payload:
+    payload_args = [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
+    rpc_envelope = [[["gArtLc", json.dumps(payload_args), None, "generic"]]]
+
     data = {
         "f.req": json.dumps(rpc_envelope),
         "at": token
@@ -74,45 +80,71 @@ def execute_google_rpc(rpc_id, payload_list, session_cfg):
     if fsid:
         data["f.sid"] = fsid
 
-    resp = requests.post(url, params=params, data=data, headers=headers, timeout=30)
-    return resp.text
+    resp = requests.post(url, params=params, data=data, headers=headers, timeout=35)
+    resp_text = resp.text
 
-def get_all_studio_artifacts_pure_rpc(notebook_id, session_cfg):
-    """Discovers all studio artifacts using Google internal RPC."""
-    # 1. Query Studio artifacts RPC endpoint
-    raw_response = execute_google_rpc("izAoDd", [notebook_id, None, 2], session_cfg)
-    
-    # Fallback to wXbhsf if empty
-    if "lh3.googleusercontent.com" not in raw_response:
-        raw_response += execute_google_rpc("wXbhsf", [notebook_id, None, 1], session_cfg)
-    
-    # Extract all CDN media links
-    urls_found = re.findall(r'https://lh3\.googleusercontent\.com/notebooklm/[a-zA-Z0-9_\-=]+', raw_response)
-    unique_urls = list(dict.fromkeys(urls_found))
-
-    # Extract artifact names
-    titles = re.findall(r'\["([A-Za-z0-9\s\-_,\.\'\?!]{3,80})"', raw_response)
-    clean_titles = [t for t in titles if not t.startswith("http") and "notebook" not in t.lower() and len(t) > 3]
-
+    # Extract JSON envelope from batchexecute response (skipping anti-XSSI prefix `)]}'`)
     items = []
-    authuser = session_cfg.get("authuser", "0")
+    
+    # 1. Parse JSON blocks in the batchexecute response
+    lines = resp_text.splitlines()
+    for line in lines:
+        if not line.strip() or line.startswith(")]}'"):
+            continue
+        try:
+            chunk = json.loads(line)
+            if isinstance(chunk, list):
+                for sub in chunk:
+                    if len(sub) > 2 and sub[0] == "wrb.fr" and sub[1] == "gArtLc":
+                        inner_data = json.loads(sub[2])
+                        # inner_data[0] contains artifact array
+                        if isinstance(inner_data, list) and len(inner_data) > 0 and isinstance(inner_data[0], list):
+                            for art in inner_data[0]:
+                                try:
+                                    art_title = art[1] or "Studio Overview"
+                                    art_type = art[2]   # 1 = Audio, 3 = Video
+                                    art_status = art[4] # 3 = Ready
+                                    
+                                    media_url = ""
+                                    if art_type == 1 and len(art) > 6 and art[6]: # Audio
+                                        media_url = art[6][3] if len(art[6]) > 3 and art[6][3] else art[6][2]
+                                    elif art_type == 3 and len(art) > 8 and art[8]: # Video
+                                        media_url = art[8][3] if len(art[8]) > 3 and art[8][3] else art[8][1]
+                                    
+                                    if media_url and art_status == 3:
+                                        clean_url = media_url.split("?")[0]
+                                        delivery_flag = "=m22-dv" if art_type == 3 else "=m140-dv-mp2"
+                                        if "=m" not in clean_url:
+                                            clean_url += f"{delivery_flag}?authuser={authuser}"
+                                        elif not clean_url.endswith(f"authuser={authuser}"):
+                                            clean_url += f"?authuser={authuser}"
+                                            
+                                        items.append({
+                                            "title": art_title,
+                                            "type": "video" if art_type == 3 else "audio",
+                                            "url": clean_url
+                                        })
+                                except Exception:
+                                    continue
+        except Exception:
+            continue
 
-    for idx, u in enumerate(unique_urls):
-        clean_url = u.split("?")[0]
-        is_video = "m22" in clean_url or "video" in clean_url
-        delivery_flag = "=m22-dv" if is_video else "=m140-dv-mp2"
+    # 2. Regex fallback scan across the raw response
+    if not items:
+        cdn_links = list(dict.fromkeys(re.findall(r'https://lh3\.googleusercontent\.com/notebooklm/[a-zA-Z0-9_\-=]+', resp_text)))
+        titles = [t for t in re.findall(r'\["([A-Za-z0-9\s\-_,\.\'\?!]{3,80})"', resp_text) if not t.startswith("http") and "notebook" not in t.lower()]
         
-        if "=m" not in clean_url:
-            clean_url += f"{delivery_flag}?authuser={authuser}"
-        elif not clean_url.endswith(f"authuser={authuser}"):
-            clean_url += f"?authuser={authuser}"
-
-        title = clean_titles[idx] if idx < len(clean_titles) else f"Studio Overview {idx + 1}"
-        items.append({
-            "title": title,
-            "type": "video" if is_video else "audio",
-            "url": clean_url
-        })
+        for idx, u in enumerate(cdn_links):
+            clean_u = u.split("?")[0]
+            is_vid = "m22" in clean_u or "video" in clean_u
+            flag = "=m22-dv" if is_vid else "=m140-dv-mp2"
+            clean_u += f"{flag}?authuser={authuser}"
+            t = titles[idx] if idx < len(titles) else f"Studio Overview {idx + 1}"
+            items.append({
+                "title": t,
+                "type": "video" if is_vid else "audio",
+                "url": clean_u
+            })
 
     return items
 
@@ -133,17 +165,16 @@ def compress_video_if_needed(input_path, max_size_mb=48):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return compressed_path if os.path.exists(compressed_path) else input_path
 
-# ================= TELEGRAM BOT HANDLERS =================
+# ================= TELEGRAM HANDLERS =================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
         return
     msg = (
-        "⚡ *Irfan Super Project (Railway Cloud)* ⚡\n\n"
-        "Commands:\n"
-        "1. `/auth <cookies_or_json>` - Save your session credentials\n"
-        "2. Send any **Notebook ID** or link to auto-download and receive all Studio media!"
+        "⚡ *IrfanLM Cloud Exporter (Railway Powered)* ⚡\n\n"
+        "1. Send `/auth <json_credentials>` to configure\n"
+        "2. Send any **Notebook ID or link** to export all Studio items using Railway's server bandwidth (Zero phone data used)!"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -154,7 +185,7 @@ async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     raw_text = update.message.text.replace("/auth", "").strip()
     if not raw_text:
-        await update.message.reply_text("❌ Usage: `/auth <cookie_header>`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Usage: `/auth <json>`", parse_mode="Markdown")
         return
 
     try:
@@ -162,10 +193,9 @@ async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "auth_config" in data:
             data.update(data["auth_config"])
         save_session(data)
-        await update.message.reply_text("✅ *Authentication configuration saved successfully!*", parse_mode="Markdown")
-    except Exception:
-        save_session({"cookie_header": raw_text, "authuser": "0"})
-        await update.message.reply_text("✅ *Cookies saved successfully!*", parse_mode="Markdown")
+        await update.message.reply_text("✅ *Session credentials saved!* Ready to process notebooks.", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid JSON format: `{str(e)}`", parse_mode="Markdown")
 
 async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -178,23 +208,23 @@ async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session_cfg = load_session()
     if not session_cfg:
-        await update.message.reply_text("❌ No credentials configured. Please send `/auth <cookies>` first.", parse_mode="Markdown")
+        await update.message.reply_text("❌ No credentials configured. Please send `/auth` first.", parse_mode="Markdown")
         return
 
-    status_msg = await update.message.reply_text(f"🔍 *Querying Studio Artifacts:* `{notebook_id}`...", parse_mode="Markdown")
+    status_msg = await update.message.reply_text(f"🔍 *Querying Studio Artifacts (gArtLc RPC):* `{notebook_id}`...", parse_mode="Markdown")
 
     try:
-        items = get_all_studio_artifacts_pure_rpc(notebook_id, session_cfg)
+        items = fetch_artifacts_via_gArtLc(notebook_id, session_cfg)
     except Exception as e:
-        await status_msg.edit_text(f"⚠️ RPC Error: `{str(e)}`", parse_mode="Markdown")
+        await status_msg.edit_text(f"⚠️ RPC Query Failed: `{str(e)}`", parse_mode="Markdown")
         return
 
     total = len(items)
     if total == 0:
-        await status_msg.edit_text(f"⚠️ No generated Studio artifacts found in notebook `{notebook_id}`. Please generate an Audio or Video overview first in the Studio tab.", parse_mode="Markdown")
+        await status_msg.edit_text(f"⚠️ No ready Studio artifacts found in notebook `{notebook_id}`. Please verify Audio/Video generations have finished.", parse_mode="Markdown")
         return
 
-    await status_msg.edit_text(f"📦 Found *{total}* item(s)! Streaming and sending to Telegram...", parse_mode="Markdown")
+    await status_msg.edit_text(f"📦 Found *{total}* Studio item(s)! Cloud server is downloading & forwarding...", parse_mode="Markdown")
 
     http_session = requests.Session()
     http_session.headers.update({
@@ -206,11 +236,12 @@ async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
         media_type = item["type"]
         url = item["url"]
         title = item["title"]
-        ext = ".m4a" if media_type == "audio" else ".mp4"
-        raw_file = f"temp_{idx}{ext}"
+        ext = ".mp4" if media_type == "video" else ".m4a"
+        raw_file = f"cloud_item_{idx}{ext}"
 
         try:
-            with http_session.get(url, stream=True, timeout=120) as r:
+            # Download occurs completely on the Railway server (0 MB mobile data used)
+            with http_session.get(url, stream=True, timeout=180) as r:
                 r.raise_for_status()
                 with open(raw_file, "wb") as f:
                     for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
@@ -227,22 +258,23 @@ async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_video(video=f, caption=caption, parse_mode="Markdown")
 
         except Exception as err:
-            await update.message.reply_text(f"⚠️ Failed to send {title}: `{str(err)}`", parse_mode="Markdown")
+            await update.message.reply_text(f"⚠️ Failed to deliver {title}: `{str(err)}`", parse_mode="Markdown")
 
         finally:
             for temp in [raw_file, f"cmp_{raw_file}"]:
                 if os.path.exists(temp):
                     os.remove(temp)
 
-    await update.message.reply_text(f"🎉 *Batch Complete!* Dispatched {total} artifacts.")
+    await update.message.reply_text(f"🎉 *Batch Export Complete!* Processed {total} artifacts via cloud server.")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("auth", auth_cmd))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_notebook))
-    print("🚀 Irfan Super Railway Bot is running...")
+    print("🚀 IrfanLM Railway Pure-RPC Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+                                        
