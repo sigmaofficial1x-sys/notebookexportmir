@@ -35,24 +35,9 @@ def generate_sapisid_hash(cookie_str, origin="https://notebooklm.google.com"):
     sha1_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"SAPISIDHASH {timestamp}_{sha1_hash}"
 
-def extract_urls_deep(obj):
-    """Recursively extracts any Google Cloud Storage CDN URLs from nested arrays."""
-    urls = []
-    if isinstance(obj, str):
-        if "googleusercontent.com" in obj:
-            urls.append(obj)
-    elif isinstance(obj, list):
-        for item in obj:
-            urls.extend(extract_urls_deep(item))
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            urls.extend(extract_urls_deep(v))
-    return urls
-
-def fetch_artifacts_via_gArtLc(notebook_id, session_cfg):
+def fetch_studio_artifacts_irfanlm_v8(notebook_id, session_cfg):
     """
-    Executes the exact `gArtLc` RPC from IrfanLM Tools v8 to retrieve
-    all ready Audio (Type 1) and Video (Type 3) artifacts.
+    Direct implementation of IrfanLM Tools v8 `gArtLc` parser.
     """
     url = "https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute"
     
@@ -62,7 +47,7 @@ def fetch_artifacts_via_gArtLc(notebook_id, session_cfg):
     fsid = session_cfg.get("fsid", "")
     authuser = str(session_cfg.get("authuser", "0"))
 
-    auth_hash = generate_sapisid_hash(cookies)
+    auth_hash = generate_sapisid_hash(cookies, "https://notebooklm.google.com")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -82,9 +67,9 @@ def fetch_artifacts_via_gArtLc(notebook_id, session_cfg):
         "_reqid": str(int(time.time() * 1000))[-6:]
     }
 
-    # Standard IrfanLM Tools v8 RPC query
-    payload_args = [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
-    rpc_envelope = [[["gArtLc", json.dumps(payload_args), None, "generic"]]]
+    # IrfanLM Tools exact argument schema
+    inner_args = json.dumps([[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"'])
+    rpc_envelope = [[["gArtLc", inner_args, None, "generic"]]]
 
     data = {
         "f.req": json.dumps(rpc_envelope),
@@ -98,59 +83,73 @@ def fetch_artifacts_via_gArtLc(notebook_id, session_cfg):
 
     items = []
 
-    # 1. Structured JSON Parse of batchexecute lines
+    # Parse Google batchexecute response stream
     for line in resp_text.splitlines():
         if not line.strip() or line.startswith(")]}'"):
             continue
         try:
             chunk = json.loads(line)
             if isinstance(chunk, list):
-                for sub in chunk:
-                    if len(sub) > 2 and sub[0] == "wrb.fr" and sub[1] == "gArtLc":
-                        inner_data = json.loads(sub[2])
-                        raw_artifacts = inner_data[0] if (isinstance(inner_data, list) and len(inner_data) > 0 and isinstance(inner_data[0], list)) else inner_data
+                for envelope in chunk:
+                    if len(envelope) > 2 and envelope[0] == "wrb.fr" and envelope[1] == "gArtLc":
+                        parsed_payload = json.loads(envelope[2])
                         
-                        if isinstance(raw_artifacts, list):
-                            for art in raw_artifacts:
-                                if not isinstance(art, list) or len(art) < 3:
+                        # parsed_payload[0] holds artifact records list
+                        artifact_list = parsed_payload[0] if (isinstance(parsed_payload, list) and len(parsed_payload) > 0 and isinstance(parsed_payload[0], list)) else parsed_payload
+                        
+                        if isinstance(artifact_list, list):
+                            for art in artifact_list:
+                                if not isinstance(art, list) or len(art) < 5:
                                     continue
                                 
                                 art_title = art[1] if len(art) > 1 and art[1] else "Studio Overview"
-                                art_type = art[2] if len(art) > 2 else 1 # 1 = Audio, 3 = Video
+                                art_type = art[2]   # 1 = Audio, 3 = Video
+                                art_status = art[4] # 3 = Ready
                                 
-                                # Find media URLs inside the artifact subtree
-                                media_candidates = extract_urls_deep(art)
+                                media_url = None
                                 
-                                for raw_url in media_candidates:
-                                    clean_url = raw_url.split("?")[0]
-                                    is_video = (art_type == 3) or ("m22" in clean_url) or ("video" in clean_url)
-                                    flag = "=m22-dv" if is_video else "=m140-dv-mp2"
+                                # Audio extractor (raw[6])
+                                if art_type == 1 and len(art) > 6 and isinstance(art[6], list):
+                                    if len(art[6]) > 3 and art[6][3]:
+                                        media_url = art[6][3]
+                                    elif len(art[6]) > 2 and art[6][2]:
+                                        media_url = art[6][2]
+                                
+                                # Video extractor (raw[8])
+                                elif art_type == 3 and len(art) > 8 and isinstance(art[8], list):
+                                    if len(art[8]) > 3 and art[8][3]:
+                                        media_url = art[8][3]
+                                    elif len(art[8]) > 1 and art[8][1]:
+                                        media_url = art[8][1]
+
+                                if media_url:
+                                    clean_url = media_url.split("?")[0]
+                                    flag = "=m22-dv" if art_type == 3 else "=m140-dv-mp2"
                                     
                                     if "=m" not in clean_url:
                                         clean_url += f"{flag}?authuser={authuser}"
                                     elif not clean_url.endswith(f"authuser={authuser}"):
                                         clean_url += f"?authuser={authuser}"
                                         
-                                    if not any(it["url"] == clean_url for it in items):
-                                        items.append({
-                                            "title": art_title,
-                                            "type": "video" if is_video else "audio",
-                                            "url": clean_url
-                                        })
+                                    items.append({
+                                        "title": art_title,
+                                        "type": "video" if art_type == 3 else "audio",
+                                        "url": clean_url
+                                    })
         except Exception:
             continue
 
-    # 2. Resilient Fallback Pattern Scan
+    # Fallback to direct URL scan if Google nested array changed
     if not items:
-        all_cdns = list(dict.fromkeys(re.findall(r'https://lh3\.googleusercontent\.com/notebooklm/[a-zA-Z0-9_\-=]+', resp_text)))
-        titles = [t for t in re.findall(r'\["([A-Za-z0-9\s\-_,\.\'\?!]{3,80})"', resp_text) if not t.startswith("http") and "notebook" not in t.lower() and len(t) > 3]
+        cdn_matches = list(dict.fromkeys(re.findall(r'https://lh3\.googleusercontent\.com/notebooklm/[a-zA-Z0-9_\-=]+', resp_text)))
+        titles_found = [t for t in re.findall(r'\["([A-Za-z0-9\s\-_,\.\'\?!]{3,80})"', resp_text) if not t.startswith("http") and "notebook" not in t.lower() and len(t) > 3]
 
-        for idx, u in enumerate(all_cdns):
+        for idx, u in enumerate(cdn_matches):
             clean_u = u.split("?")[0]
             is_vid = "m22" in clean_u or "video" in clean_u
             flag = "=m22-dv" if is_vid else "=m140-dv-mp2"
             clean_u += f"{flag}?authuser={authuser}"
-            t = titles[idx] if idx < len(titles) else f"Studio Overview {idx + 1}"
+            t = titles_found[idx] if idx < len(titles_found) else f"Studio Overview {idx + 1}"
             items.append({
                 "title": t,
                 "type": "video" if is_vid else "audio",
@@ -225,17 +224,17 @@ async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"🔍 *Querying Studio Artifacts (gArtLc RPC):* `{notebook_id}`...", parse_mode="Markdown")
 
     try:
-        items = fetch_artifacts_via_gArtLc(notebook_id, session_cfg)
+        items = fetch_studio_artifacts_irfanlm_v8(notebook_id, session_cfg)
     except Exception as e:
         await status_msg.edit_text(f"⚠️ RPC Query Failed: `{str(e)}`", parse_mode="Markdown")
         return
 
     total = len(items)
     if total == 0:
-        await status_msg.edit_text(f"⚠️ No ready Studio artifacts found in notebook `{notebook_id}`. Audio/Video generation may still be processing on Google's servers.", parse_mode="Markdown")
+        await status_msg.edit_text(f"⚠️ No ready Studio artifacts found in notebook `{notebook_id}`.", parse_mode="Markdown")
         return
 
-    await status_msg.edit_text(f"📦 Found *{total}* Studio item(s)! Cloud server is downloading & forwarding...", parse_mode="Markdown")
+    await status_msg.edit_text(f"📦 Found *{total}* Studio item(s)! Railway cloud server is downloading & forwarding...", parse_mode="Markdown")
 
     http_session = requests.Session()
     http_session.headers.update({
@@ -251,7 +250,7 @@ async def handle_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_file = f"cloud_item_{idx}{ext}"
 
         try:
-            # Download occurs completely on Railway server bandwidth
+            # Download takes place entirely on Railway (Zero phone data)
             with http_session.get(url, stream=True, timeout=180) as r:
                 r.raise_for_status()
                 with open(raw_file, "wb") as f:
@@ -288,4 +287,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-                                    
+                                
