@@ -2,9 +2,8 @@ import os
 import asyncio
 import logging
 import uvicorn
-from typing import List, Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
@@ -27,19 +26,6 @@ if not BOT_TOKEN:
 
 app = FastAPI(title="NotebookLM Studio Exporter")
 tg_app = Application.builder().token(BOT_TOKEN).build()
-
-# --- Pydantic Data Models ---
-class StudioItem(BaseModel):
-    title: str = Field(default="Studio Item")
-    type: str = Field(default="video")  # 'video' | 'audio' | 'document'
-    url: str = Field(default="")
-
-class ExportBatchRequest(BaseModel):
-    chat_id: str
-    notebook_id: str
-    notebook_title: str
-    cookies: Optional[str] = ""  # Optional to prevent any HTTP 422 errors
-    items: List[StudioItem]
 
 # --- Telegram Bot Commands ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -78,30 +64,50 @@ def health_check():
         "service": "NotebookLM Studio Exporter"
     }
 
-# --- Batch Export Webhook Endpoint ---
+# --- Batch Export Webhook (No Pydantic Strict Checks = Zero 422 Errors) ---
 @app.post("/api/export-batch")
-async def export_batch(payload: ExportBatchRequest, background_tasks: BackgroundTasks):
-    if not payload.items:
-        raise HTTPException(status_code=400, detail="No studio items found in payload.")
+async def export_batch(request: Request, background_tasks: BackgroundTasks):
+    try:
+        data = await request.json()
+    except Exception as e:
+        logger.error(f"Failed to decode JSON: {e}")
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body"})
 
-    logger.info(f"Received batch of {len(payload.items)} items for '{payload.notebook_title}' (Chat ID: {payload.chat_id})")
+    chat_id = str(data.get("chat_id") or "")
+    notebook_id = str(data.get("notebook_id") or "")
+    notebook_title = str(data.get("notebook_title") or "Notebook Export")
+    raw_items = data.get("items") or []
 
-    # Queue export task in the background
+    if not chat_id:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Missing chat_id"})
+
+    # Normalize items to ensure safe execution
+    clean_items = []
+    for idx, itm in enumerate(raw_items, start=1):
+        if isinstance(itm, dict):
+            clean_items.append({
+                "title": str(itm.get("title") or f"Item {idx}"),
+                "type": str(itm.get("type") or "video"),
+                "url": str(itm.get("url") or "")
+            })
+
+    logger.info(f"Accepted batch of {len(clean_items)} items for notebook '{notebook_title}' (Chat ID: {chat_id})")
+
+    # Run queue in background
     background_tasks.add_task(
         process_export_queue,
         bot_token=BOT_TOKEN,
-        chat_id=payload.chat_id,
-        notebook_title=payload.notebook_title,
-        items=[item.model_dump() for item in payload.items]
+        chat_id=chat_id,
+        notebook_title=notebook_title,
+        items=clean_items
     )
 
-    return {
+    return JSONResponse(content={
         "ok": True,
         "status": "queued",
-        "total_items": len(payload.items),
-        "notebook": payload.notebook_title
-    }
+        "total_items": len(clean_items),
+        "notebook": notebook_title
+    })
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
-    
