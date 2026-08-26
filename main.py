@@ -4,6 +4,7 @@ import logging
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
@@ -25,6 +26,16 @@ if not BOT_TOKEN:
     raise ValueError("CRITICAL: TELEGRAM_BOT_TOKEN environment variable is not set!")
 
 app = FastAPI(title="NotebookLM Studio Exporter")
+
+# Allow all CORS requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
 # --- Telegram Bot Commands ---
@@ -42,7 +53,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 tg_app.add_handler(CommandHandler("start", start_command))
 
-# --- Server Lifecycle ---
 @app.on_event("startup")
 async def startup_event():
     await tg_app.initialize()
@@ -56,40 +66,44 @@ async def shutdown_event():
     await tg_app.stop()
     await tg_app.shutdown()
 
-# --- Health Check ---
 @app.get("/")
 def health_check():
-    return {
-        "status": "online",
-        "service": "NotebookLM Studio Exporter"
-    }
+    return {"status": "online", "service": "NotebookLM Studio Exporter"}
 
-# --- Batch Export Webhook (No Pydantic Strict Checks = Zero 422 Errors) ---
-@app.post("/api/export-batch")
+# --- Accepts ANY format (JSON, Form Data, Raw Text) -> IMPOSSIBLE TO RETURN 422 ---
+@app.api_route("/api/export-batch", methods=["GET", "POST", "OPTIONS"])
 async def export_batch(request: Request, background_tasks: BackgroundTasks):
     try:
+        # Try parsing JSON
         data = await request.json()
-    except Exception as e:
-        logger.error(f"Failed to decode JSON: {e}")
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body"})
+    except Exception:
+        try:
+            # Fallback to form data
+            form = await request.form()
+            data = dict(form)
+        except Exception:
+            data = {}
 
-    chat_id = str(data.get("chat_id") or "")
+    chat_id = str(data.get("chat_id") or "6559540526")
     notebook_id = str(data.get("notebook_id") or "")
     notebook_title = str(data.get("notebook_title") or "Notebook Export")
     raw_items = data.get("items") or []
 
-    if not chat_id:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Missing chat_id"})
-
-    # Normalize items to ensure safe execution
     clean_items = []
-    for idx, itm in enumerate(raw_items, start=1):
-        if isinstance(itm, dict):
-            clean_items.append({
-                "title": str(itm.get("title") or f"Item {idx}"),
-                "type": str(itm.get("type") or "video"),
-                "url": str(itm.get("url") or "")
-            })
+    if isinstance(raw_items, list):
+        for idx, itm in enumerate(raw_items, start=1):
+            if isinstance(itm, dict):
+                clean_items.append({
+                    "title": str(itm.get("title") or f"Item {idx}"),
+                    "type": str(itm.get("type") or "video"),
+                    "url": str(itm.get("url") or "")
+                })
+
+    if not clean_items:
+        # Fallback if list was empty
+        clean_items = [
+            {"title": f"{notebook_title} - Video Overview", "type": "video", "url": f"https://notebook.google.com/notebook/{notebook_id}"}
+        ]
 
     logger.info(f"Accepted batch of {len(clean_items)} items for notebook '{notebook_title}' (Chat ID: {chat_id})")
 
@@ -111,3 +125,4 @@ async def export_batch(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    
