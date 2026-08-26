@@ -7,7 +7,7 @@ from telegram import Bot
 logger = logging.getLogger("worker")
 
 async def process_export_queue(bot_token: str, chat_id: str, notebook_title: str, items: list, cookies: str = ""):
-    """Railway cloud server downloads authenticated Google CDN files and streams to Telegram."""
+    """Railway cloud server downloads Google CDN files and delivers native video and audio to Telegram."""
     bot = Bot(token=bot_token)
     total_items = len(items)
 
@@ -15,15 +15,15 @@ async def process_export_queue(bot_token: str, chat_id: str, notebook_title: str
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"🚀 **Starting Cloud Studio Export**\n"
+                f"🚀 **Starting Studio Media Export**\n"
                 f"📁 **Notebook:** `{notebook_title}`\n"
                 f"📦 **Total Items:** `{total_items}`\n\n"
-                f"⚡ _Railway cloud server is downloading & streaming directly to Telegram..._"
+                f"⚡ _Downloading MP4 videos and MP3 audio in the cloud..._"
             ),
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Failed to send initial status message: {e}")
+        logger.error(f"Failed to send initial status: {e}")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -40,15 +40,22 @@ async def process_export_queue(bot_token: str, chat_id: str, notebook_title: str
         url = item.get("url", "").strip()
         item_type = item.get("type", "video").lower()
 
-        if not url or url.startswith("blob:"):
-            logger.warning(f"Skipping {title}: Invalid or empty URL")
-            continue
-
-        temp_ext = "mp4" if item_type == "video" else "mp3" if item_type == "audio" else "txt"
+        # If it's a video or undefined, make it MP4. If audio, make it MP3.
+        temp_ext = "mp3" if item_type == "audio" else "mp4"
         temp_file = f"/tmp/{idx}_{title}.{temp_ext}"
 
+        if not url or "notebook.google.com" in url:
+            caption = f"📌 [{idx}/{total_items}] **{title}** ({item_type.upper()})\n📁 `{notebook_title}`"
+            try:
+                await bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Error sending card: {e}")
+            await asyncio.sleep(2.0)
+            continue
+
         try:
-            # 1. Railway server downloads file using Google Auth Cookies
+            # 1. Download file from Google CDN
             async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                     if resp.status == 200:
@@ -56,43 +63,47 @@ async def process_export_queue(bot_token: str, chat_id: str, notebook_title: str
                             while chunk := await resp.content.read(1024 * 1024):
                                 f.write(chunk)
                     else:
-                        logger.error(f"Failed download for {title}: HTTP {resp.status}")
+                        logger.error(f"Download failed for {title}: HTTP {resp.status}")
                         await bot.send_message(
                             chat_id=chat_id,
                             text=f"⚠️ [{idx}/{total_items}] Could not download `{title}` (HTTP {resp.status})."
                         )
                         continue
 
-            # 2. Check File Size (Telegram Standard Bot Upload Limit: 50MB)
+            # 2. Check File Size (Telegram Bot Limit: 50MB)
             file_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
             if file_size_mb > 49.5:
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"⚠️ [{idx}/{total_items}] `{title}` is {file_size_mb:.1f} MB (exceeds Telegram 50MB bot upload limit).\n\n"
+                        f"⚠️ [{idx}/{total_items}] `{title}` is {file_size_mb:.1f} MB (exceeds Telegram 50MB bot limit).\n\n"
                         f"🔗 **Direct Auth Link:** {url}"
                     )
                 )
                 success_count += 1
             else:
-                # 3. Stream from Railway directly into Telegram
+                # 3. Send video directly as Telegram Video or Audio
                 caption = f"[{idx}/{total_items}] 📁 {notebook_title}\n📌 {title}"
                 with open(temp_file, "rb") as media_file:
-                    if item_type == "video":
-                        await bot.send_video(chat_id=chat_id, video=media_file, caption=caption)
-                    elif item_type == "audio":
-                        await bot.send_audio(chat_id=chat_id, audio=media_file, caption=caption)
+                    if temp_ext == "mp4":
+                        await bot.send_video(
+                            chat_id=chat_id,
+                            video=media_file,
+                            caption=caption,
+                            supports_streaming=True
+                        )
                     else:
-                        await bot.send_document(chat_id=chat_id, document=media_file, caption=caption)
+                        await bot.send_audio(
+                            chat_id=chat_id,
+                            audio=media_file,
+                            caption=caption
+                        )
                 
                 success_count += 1
 
         except Exception as e:
-            logger.error(f"Error processing item {title}: {e}")
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Error uploading `{title}`: {str(e)}"
-            )
+            logger.error(f"Error uploading {title}: {e}")
+            await bot.send_message(chat_id=chat_id, text=f"❌ Error on `{title}`: {str(e)}")
         finally:
             if os.path.exists(temp_file):
                 try:
@@ -100,7 +111,7 @@ async def process_export_queue(bot_token: str, chat_id: str, notebook_title: str
                 except Exception:
                     pass
 
-        # Safe rate limit delay between Telegram dispatches
+        # 2.5s safe delay to prevent Telegram flood limits
         await asyncio.sleep(2.5)
 
     try:
@@ -108,10 +119,11 @@ async def process_export_queue(bot_token: str, chat_id: str, notebook_title: str
             chat_id=chat_id,
             text=(
                 f"🎉 **Batch Export Finished!**\n\n"
-                f"✅ **Processed:** `{success_count}/{total_items}` items\n"
+                f"✅ **Delivered:** `{success_count}/{total_items}` media files\n"
                 f"📁 **Notebook:** `{notebook_title}`"
             ),
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Failed to send completion message: {e}")
+        logger.error(f"Error sending final completion: {e}")
+        
